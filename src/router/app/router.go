@@ -2,6 +2,7 @@ package app
 
 import (
 	"log"
+	"runtime"
 	"time"
 
 	"code.cloudfoundry.org/tlsconfig"
@@ -24,6 +25,7 @@ type Router struct {
 	c      *Config
 	server *server.Server
 	addrs  Addrs
+	fanout *v2.FanoutWriter
 }
 
 // NewRouter creates a new Router with the given options. Each provided
@@ -72,6 +74,17 @@ func WithBufferSizes(
 	return func(r *Router) {
 		r.c.IngressBufferSize = ingressBufferSize
 		r.c.EgressBufferSize = egressBufferSize
+	}
+}
+
+// WithFanoutWriter returns a RouterOption that enables or disables the
+// FanoutWriter feature. When disabled (default), the Repeater publishes
+// directly via v2PubSub.Publish(). When enabled, it fans out to workerCount workers.
+// Default worker count is GOMAXPROC when workerCount is 0
+func WithFanoutWriter(enabled bool, workerCount int) RouterOption {
+	return func(r *Router) {
+		r.c.FanoutWriterEnabled = enabled
+		r.c.PublishWorkers = workerCount
 	}
 }
 
@@ -149,6 +162,10 @@ func (d *Router) Start() {
 		ingress,
 	)
 	v2PubSub := v2.NewPubSub()
+
+	// FanoutWriter calls Publish() from multiple goroutines, so a given
+	// subscriber's diode can be written to concurrently. The default
+	// single-writer diode is not safe for that.
 	v2Egress := v2.NewEgressServer(
 		v2PubSub,
 		metricClient,
@@ -156,6 +173,7 @@ func (d *Router) Start() {
 		subscriptionsMetric,
 		100*time.Millisecond,
 		100,
+		d.c.FanoutWriterEnabled,
 	)
 
 	tlsConf, err := tlsconfig.Build(
@@ -200,8 +218,20 @@ func (d *Router) Start() {
 	messageRouter := sinks.NewMessageRouter(v1Router)
 	go messageRouter.Start(v1Buf)
 
-	repeater := v2.NewRepeater(v2PubSub.Publish, v2Buf.Next)
-	go repeater.Start()
+	workers := d.c.PublishWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+
+	if d.c.FanoutWriterEnabled {
+		d.fanout = v2.NewFanoutWriter(v2PubSub.Publish, workers)
+		d.fanout.Start()
+		repeater := v2.NewRepeater(d.fanout.Write, v2Buf.Next)
+		go repeater.Start()
+	} else {
+		repeater := v2.NewRepeater(v2PubSub.Publish, v2Buf.Next)
+		go repeater.Start()
+	}
 
 	go d.server.Start()
 
@@ -222,6 +252,9 @@ func (d *Router) Addrs() Addrs {
 func (d *Router) Stop() {
 	// TODO: Drain
 	d.server.Stop()
+	if d.fanout != nil {
+		d.fanout.Stop()
+	}
 }
 
 func initV2Metrics(c *Config) *metricemitter.Client {

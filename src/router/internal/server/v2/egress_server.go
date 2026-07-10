@@ -24,6 +24,13 @@ type DataSetter interface {
 	Set(*loggregator_v2.Envelope)
 }
 
+// envelopeDiode is satisfied by both the single-writer and many-writer V2
+// diode implementations, allowing BatchedReceiver to pick one at runtime.
+type envelopeDiode interface {
+	DataSetter
+	Next() *loggregator_v2.Envelope
+}
+
 // EgressServer implements the loggregator_v2.EgressServer interface.
 type EgressServer struct {
 	loggregator_v2.EgressServer
@@ -34,9 +41,15 @@ type EgressServer struct {
 	subscriptionsMetric *metricemitter.Gauge
 	batchInterval       time.Duration
 	batchSize           uint
+	manyToOneDiode      bool
 }
 
-// NewEgressServer is the constructor for EgressServer.
+// NewEgressServer is the constructor for EgressServer. manyToOneDiode
+// configures each subscriber's diode to tolerate concurrent writers instead
+// of assuming a single writer. This is required when Publish() may be called
+// concurrently for the same subscriber, as is the case when FanoutWriter is
+// enabled; pass false otherwise since the single-writer diode has less
+// overhead.
 func NewEgressServer(
 	s Subscriber,
 	m MetricClient,
@@ -44,6 +57,7 @@ func NewEgressServer(
 	subscriptionsMetric *metricemitter.Gauge,
 	batchInterval time.Duration,
 	batchSize uint,
+	manyToOneDiode bool,
 ) *EgressServer {
 	// metric-documentation-v2: (loggregator.doppler.egress) Number of
 	// envelopes read from a diode to be sent to subscriptions.
@@ -58,6 +72,7 @@ func NewEgressServer(
 		subscriptionsMetric: subscriptionsMetric,
 		batchInterval:       batchInterval,
 		batchSize:           batchSize,
+		manyToOneDiode:      manyToOneDiode,
 	}
 }
 
@@ -82,14 +97,17 @@ func (s *EgressServer) BatchedReceiver(
 	s.subscriptionsMetric.Increment(1.0)
 	defer s.subscriptionsMetric.Decrement(1.0)
 
-	d := diodes.NewOneToOneWaiterEnvelopeV2(
-		1000,
-		gendiode.AlertFunc(func(missed int) {
-			log.Printf("Dropped %d envelopes (v2 buffer) ShardID: %s", missed, req.ShardId)
-			s.Alert(missed)
-		}),
-		gendiode.WithWaiterContext(sender.Context()),
-	)
+	alerter := gendiode.AlertFunc(func(missed int) {
+		log.Printf("Dropped %d envelopes (v2 buffer) ShardID: %s", missed, req.ShardId)
+		s.Alert(missed)
+	})
+
+	var d envelopeDiode
+	if s.manyToOneDiode {
+		d = diodes.NewManyToOneWaiterEnvelopeV2(1000, alerter, gendiode.WithWaiterContext(sender.Context()))
+	} else {
+		d = diodes.NewOneToOneWaiterEnvelopeV2(1000, alerter, gendiode.WithWaiterContext(sender.Context()))
+	}
 	cancel := s.subscriber.Subscribe(req, d)
 	defer cancel()
 
